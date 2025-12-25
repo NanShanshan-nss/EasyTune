@@ -1,0 +1,12 @@
+torch
+transformers
+peft
+bitsandbytes
+accelerate
+datasets
+fastapi
+uvicorn
+streamlit
+pandas
+scipy
+python-multipart

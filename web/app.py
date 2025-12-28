@@ -9,9 +9,11 @@ from pathlib import Path
 
 
 
+import socket
+import psutil
+
 # 设置页面宽屏模式，看起来更像专业大模型
 st.set_page_config(page_title="EasyTune Pro", layout="wide")
-
 
 API_URL = "http://localhost:8000"
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -24,7 +26,72 @@ if "chat_history" not in st.session_state:
     st.session_state["chat_history"] = []
 if "task_id" not in st.session_state:
     st.session_state["task_id"] = ""
+  
+# ==================== 辅助函数 ====================
+@st.fragment(run_every="2s")
+def system_monitor():
+    try:
+        res = requests.get(f"{API_URL}/system_status", timeout=1)
+        if res.status_code == 200:
+            data = res.json()
+            
+            # --- GPU 监控 ---
+            st.markdown("##### 🎮 GPU 状态")
+            if "gpu_error" in data:
+                st.caption(f"GPU: {data['gpu_error']}")
+            else:
+                # GPU 利用率
+                gpu_util = data.get('gpu_util', 0)
+                st.progress(gpu_util / 100, text=f"GPU 利用率: {gpu_util}%")
+                
+                # 显存使用
+                used = data.get('gpu_memory_used', 0)
+                total = data.get('gpu_memory_total', 1)
+                percent = min(used / total, 1.0)
+                st.progress(percent, text=f"显存 (VRAM): {used}MB / {total}MB")
+            
+        else:
+            st.caption("无法连接监控接口")
+    except Exception:
+        st.caption("监控服务离线")
 
+# ==================== 侧边栏：任务历史 ====================
+with st.sidebar:
+    st.header("📜 历史任务")
+    if st.button("🔄 刷新列表"):
+        st.rerun()
+        
+    try:
+        res = requests.get(f"{API_URL}/tasks")
+        if res.status_code == 200:
+            tasks = res.json()
+            if tasks:
+                # 转为 DataFrame 展示更直观
+                df_tasks = pd.DataFrame(tasks)
+                # 只保留关键列
+                df_display = df_tasks[["task_id", "status", "args"]]
+                
+                # 让用户选择
+                selected_task_id = st.selectbox(
+                    "选择历史任务",
+                    options=df_tasks["task_id"].tolist(),
+                    format_func=lambda x: f"{x[:8]}... ({df_tasks[df_tasks['task_id']==x]['status'].values[0]})"
+                )
+                
+                if st.button("📂 加载选中任务"):
+                    st.session_state["task_id"] = selected_task_id
+                    st.success(f"已加载任务: {selected_task_id}")
+            else:
+                st.info("暂无历史任务")
+        else:
+            st.error("无法获取任务列表")
+    except Exception as e:
+        st.error(f"连接后端失败: {e}")
+
+    st.divider()
+
+    st.header("🖥️ 系统监控")
+    system_monitor()
 
 # ==================== 辅助函数 ====================
 def load_training_loss(task_id):
@@ -269,6 +336,7 @@ with tab2:
 
     # 侧边栏控制
     with st.sidebar:
+        st.divider()
         st.header("🎮 对话控制")
         use_lora = st.toggle("🔥 启用微调模型 (LoRA)", value=False)
 

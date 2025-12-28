@@ -4,15 +4,104 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import shutil
 import uuid
+import sqlite3
+import json
 import torch
+import pynvml
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 from core.trainer import train_model
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- 数据库初始化 ---
+DB_PATH = "tasks.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    # 创建表（如果不存在）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tasks (
+            task_id TEXT PRIMARY KEY,
+            status TEXT,
+            file_path TEXT,
+            args TEXT,
+            output_path TEXT,
+            error TEXT
+        )
+    ''')
+    
+    # 检查是否需要迁移（添加新列）
+    cursor.execute("PRAGMA table_info(tasks)")
+    columns = [info[1] for info in cursor.fetchall()]
+    
+    if 'args' not in columns:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN args TEXT")
+    if 'output_path' not in columns:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN output_path TEXT")
+        
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- 系统监控 ---
+def get_gpu_status():
+    status = {}
+    
+    # 获取 GPU (NVIDIA)
+    try:
+        pynvml.nvmlInit()
+        device_count = pynvml.nvmlDeviceGetCount()
+        if device_count > 0:
+            # 默认只看第一张卡
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            util_info = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            
+            name = pynvml.nvmlDeviceGetName(handle)
+            if isinstance(name, bytes):
+                name = name.decode("utf-8")
+
+            status.update({
+                "gpu_name": name,
+                "gpu_memory_used": mem_info.used // 1024**2,
+                "gpu_memory_total": mem_info.total // 1024**2,
+                "gpu_util": util_info.gpu,
+                "gpu_memory_util": util_info.memory
+            })
+        else:
+            status["gpu_error"] = "No NVIDIA GPU found"
+        
+        pynvml.nvmlShutdown()
+        
+    except Exception as e:
+        status["gpu_error"] = str(e)
+        # 填充默认值防止前端报错
+        status.update({
+            "gpu_memory_used": 0,
+            "gpu_memory_total": 0,
+            "gpu_util": 0
+        })
+
+    return status
+
+@app.get("/system_status")
+async def system_status():
+    return get_gpu_status()
 
 # --- 全局推理引擎 (单例模式) ---
 class InferenceEngine:
@@ -98,8 +187,6 @@ class InferenceEngine:
 engine = InferenceEngine()
 
 # --- API 定义 ---
-tasks = {}
-
 class TrainRequest(BaseModel):
     file_id: str
     args: dict = None
@@ -124,21 +211,79 @@ async def start_training(req: TrainRequest,
     data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
     data_path = os.path.join(data_dir, f"{req.file_id}.json")
     
-    tasks[task_id] = {"status": "running"}
+    # 预计算 output_path
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    output_path = os.path.join(project_root, "output", task_id)
+
+    # 写入数据库
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    args_json = json.dumps(req.args) if req.args else "{}"
+    cursor.execute(
+        "INSERT INTO tasks (task_id, status, file_path, args, output_path) VALUES (?, ?, ?, ?, ?)", 
+        (task_id, "running", data_path, args_json, output_path)
+    )
+    conn.commit()
+    conn.close()
+
     background_tasks.add_task(run_training_background, task_id, data_path, req.args)
     return {"task_id": task_id, "status": "started"}
 
 def run_training_background(task_id, data_path, user_args):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
     try:
-        train_model(task_id, data_path,user_args)
-        tasks[task_id]["status"] = "success"
+        train_model(task_id, data_path, user_args)
+        cursor.execute("UPDATE tasks SET status = ? WHERE task_id = ?", ("success", task_id))
     except Exception as e:
-        tasks[task_id]["status"] = "failed"
-        tasks[task_id]["error"] = str(e)
+        cursor.execute("UPDATE tasks SET status = ?, error = ? WHERE task_id = ?", ("failed", str(e), task_id))
+    finally:
+        conn.commit()
+        conn.close()
 
 @app.get("/status/{task_id}")
 async def get_status(task_id: str):
-    return tasks.get(task_id, {"status": "not_found"})
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT status, error, file_path, args, output_path FROM tasks WHERE task_id = ?", (task_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if row:
+        status, error, file_path, args, output_path = row
+        response = {
+            "task_id": task_id,
+            "status": status,
+            "file_path": file_path,
+            "args": json.loads(args) if args else None,
+            "output_path": output_path
+        }
+        if error:
+            response["error"] = error
+        return response
+    else:
+        return {"status": "not_found"}
+
+@app.get("/tasks")
+async def list_tasks():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT task_id, status, file_path, args, output_path, error FROM tasks")
+    rows = cursor.fetchall()
+    conn.close()
+    
+    tasks_list = []
+    for row in rows:
+        task_id, status, file_path, args, output_path, error = row
+        tasks_list.append({
+            "task_id": task_id,
+            "status": status,
+            "file_path": file_path,
+            "args": json.loads(args) if args else None,
+            "output_path": output_path,
+            "error": error
+        })
+    return tasks_list
 
 # 新增：聊天接口
 class ChatRequest(BaseModel):

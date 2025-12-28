@@ -11,3 +11,5 @@ pandas
 scipy
 python-multipart
 plotly
+pynvml
+psutil
